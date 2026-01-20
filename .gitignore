@@ -1,0 +1,36 @@
+# Dependencies
+/vendor/
+/node_modules/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build
+/dist/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Testing
+/coverage/
+.phpunit.result.cache
+
+# Composer
+composer.lock
+
+# WordPress
+*.sql
+*.sql.gz

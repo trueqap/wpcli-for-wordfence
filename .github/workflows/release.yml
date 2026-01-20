@@ -1,0 +1,125 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - 'wpcli-for-wordfence.php'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Extract version from plugin
+        id: get_version
+        run: |
+          VERSION=$(grep -oP "Version:\s*\K[0-9]+\.[0-9]+\.[0-9]+" wpcli-for-wordfence.php)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Detected version: $VERSION"
+
+      - name: Check if release exists
+        id: check_release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.get_version.outputs.version }}
+        run: |
+          if gh release view "v${VERSION}" > /dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "Release v${VERSION} already exists, skipping..."
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "Release v${VERSION} does not exist, creating..."
+          fi
+
+      - name: Install Composer dependencies
+        if: steps.check_release.outputs.exists == 'false'
+        run: |
+          composer install --no-dev --optimize-autoloader --no-interaction
+
+      - name: Create plugin zip
+        if: steps.check_release.outputs.exists == 'false'
+        env:
+          VERSION: ${{ steps.get_version.outputs.version }}
+        run: |
+          # Create dist directory
+          mkdir -p dist
+
+          # Create plugin directory structure
+          mkdir -p dist/wpcli-for-wordfence
+
+          # Copy plugin files (exclude dev files, but include vendor)
+          rsync -av --exclude='.git' \
+                    --exclude='.github' \
+                    --exclude='node_modules' \
+                    --exclude='.gitignore' \
+                    --exclude='.editorconfig' \
+                    --exclude='composer.json' \
+                    --exclude='composer.lock' \
+                    --exclude='phpcs.xml' \
+                    --exclude='phpunit.xml' \
+                    --exclude='tests' \
+                    --exclude='dist' \
+                    --exclude='SECURITY.md' \
+                    ./ dist/wpcli-for-wordfence/
+
+          # Create zip
+          cd dist
+          zip -r "wpcli-for-wordfence-${VERSION}.zip" wpcli-for-wordfence
+
+          echo "Created: wpcli-for-wordfence-${VERSION}.zip"
+          ls -la
+
+      - name: Extract changelog for version
+        if: steps.check_release.outputs.exists == 'false'
+        id: changelog
+        env:
+          VERSION: ${{ steps.get_version.outputs.version }}
+        run: |
+          if [ -f "CHANGELOG.md" ]; then
+            # Extract content between this version and next version header
+            NOTES=$(awk "/## \[${VERSION}\]/{flag=1; next} /## \[/{flag=0} flag" CHANGELOG.md)
+
+            if [ -z "$NOTES" ]; then
+              NOTES="Release v${VERSION}"
+            fi
+          else
+            NOTES="Release v${VERSION}"
+          fi
+
+          # Save to file for multi-line support
+          echo "$NOTES" > release_notes.md
+          echo "Release notes extracted"
+
+      - name: Create GitHub Release
+        if: steps.check_release.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.get_version.outputs.version }}
+        run: |
+          gh release create "v${VERSION}" \
+            --title "v${VERSION}" \
+            --notes-file release_notes.md \
+            "dist/wpcli-for-wordfence-${VERSION}.zip"
+
+      - name: Summary
+        env:
+          VERSION: ${{ steps.get_version.outputs.version }}
+          REPO: ${{ github.repository }}
+          EXISTS: ${{ steps.check_release.outputs.exists }}
+        run: |
+          if [ "$EXISTS" == "true" ]; then
+            echo "### Release Skipped" >> $GITHUB_STEP_SUMMARY
+            echo "Release v${VERSION} already exists." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### Release Created" >> $GITHUB_STEP_SUMMARY
+            echo "Version: v${VERSION}" >> $GITHUB_STEP_SUMMARY
+            echo "Download: [wpcli-for-wordfence-${VERSION}.zip](https://github.com/${REPO}/releases/download/v${VERSION}/wpcli-for-wordfence-${VERSION}.zip)" >> $GITHUB_STEP_SUMMARY
+          fi
