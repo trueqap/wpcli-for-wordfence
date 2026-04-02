@@ -113,36 +113,51 @@ class ScanCommand
         }
 
         $status = WordfenceService::getScanStatus();
-
-        $items = [
-            [
-                'Property' => 'Running',
-                'Value' => $status['running'] ? 'Yes' : 'No',
-            ],
-            [
-                'Property' => 'Stage',
-                'Value' => $status['stage'] ?: 'Idle',
-            ],
-            [
-                'Property' => 'Last Scan',
-                'Value' => $status['last_scan'],
-            ],
-        ];
-
-        // Add duration if available
-        if (!empty($status['last_scan_duration'])) {
-            $items[] = [
-                'Property' => 'Duration',
-                'Value' => $status['last_scan_duration'] . ' seconds',
-            ];
-        }
-
         $format = $assoc_args['format'] ?? 'table';
 
         if ($format === 'json') {
             WP_CLI::log(json_encode($status, JSON_PRETTY_PRINT));
-        } else {
-            WP_CLI\Utils\format_items($format, $items, ['Property', 'Value']);
+            return;
+        }
+
+        $stageText = $status['stage'] ?: 'Idle';
+        if (!empty($status['stage_progress'])) {
+            $stageText .= ' — ' . $status['stage_progress'];
+        }
+
+        $items = [
+            ['Property' => 'Running',  'Value' => $status['running'] ? 'Yes' : 'No'],
+            ['Property' => 'Stage',    'Value' => $stageText],
+            ['Property' => 'Progress', 'Value' => $status['stages_total'] > 0
+                ? sprintf('%d/%d stages (%d%%)', $status['stages_complete'], $status['stages_total'], $status['overall_progress'])
+                : 'N/A'],
+            ['Property' => 'Last Scan', 'Value' => $status['last_scan']],
+        ];
+
+        if (!empty($status['last_scan_duration'])) {
+            $items[] = ['Property' => 'Duration', 'Value' => $status['last_scan_duration'] . ' seconds'];
+        }
+
+        // Summary counters
+        $summary = $status['summary'] ?? [];
+        if (!empty($summary)) {
+            $counterParts = [];
+            foreach (['scannedFiles' => 'files', 'scannedPlugins' => 'plugins', 'scannedThemes' => 'themes', 'scannedPosts' => 'posts', 'scannedComments' => 'comments', 'scannedURLs' => 'URLs'] as $key => $label) {
+                if (!empty($summary[$key])) {
+                    $counterParts[] = number_format($summary[$key]) . ' ' . $label;
+                }
+            }
+            if (!empty($counterParts)) {
+                $items[] = ['Property' => 'Scanned', 'Value' => implode(', ', $counterParts)];
+            }
+        }
+
+        WP_CLI\Utils\format_items($format, $items, ['Property', 'Value']);
+
+        // Show stage pipeline if scan is running
+        if ($status['running'] && !empty($status['stage_details'])) {
+            WP_CLI::log('');
+            WP_CLI::log(self::formatStagePipeline($status['stage_details']));
         }
     }
 
@@ -260,6 +275,9 @@ class ScanCommand
     /**
      * Watch scan progress in real-time
      *
+     * Displays per-stage progress, live summary counters, and a real-time
+     * activity log — the same information shown in the Wordfence admin panel.
+     *
      * ## OPTIONS
      *
      * [--interval=<seconds>]
@@ -268,10 +286,14 @@ class ScanCommand
      * default: 5
      * ---
      *
+     * [--verbose]
+     * : Show real-time activity log messages from the wfStatus table
+     *
      * ## EXAMPLES
      *
      *     $ wp wfsec scan watch
-     *     $ wp wfsec scan watch --interval=10
+     *     $ wp wfsec scan watch --interval=3
+     *     $ wp wfsec scan watch --verbose
      *
      * @when after_wp_load
      */
@@ -285,50 +307,150 @@ class ScanCommand
         if ($interval < 1) {
             $interval = 5;
         }
+        $verbose = isset($assoc_args['verbose']);
 
-        WP_CLI::log('Watching scan status... (Press Ctrl+C to stop)');
+        WP_CLI::log('Watching scan progress... (Press Ctrl+C to stop)');
         WP_CLI::log('');
 
         $lastStage = '';
         $startTime = time();
+        $lastCtime = (float) (time() - 5); // Start from a few seconds ago
 
         while (true) {
             $status = WordfenceService::getScanStatus();
             $elapsed = time() - $startTime;
 
-            // Clear line and print status
-            $line = sprintf(
-                "\r[%s] Running: %s | Stage: %s | Elapsed: %s",
+            // --- Header line: stage + progress ---
+            $stageText = $status['stage'] ?: 'N/A';
+            if (!empty($status['stage_progress'])) {
+                $stageText .= ' ' . $status['stage_progress'];
+            }
+
+            $overallText = '';
+            if ($status['stages_total'] > 0) {
+                $overallText = sprintf(
+                    ' | Overall: %d/%d stages (%d%%)',
+                    $status['stages_complete'],
+                    $status['stages_total'],
+                    $status['overall_progress']
+                );
+            }
+
+            $headerLine = sprintf(
+                '[%s] %s | Stage: %s%s | Elapsed: %s',
                 date('H:i:s'),
-                $status['running'] ? WP_CLI::colorize('%GYes%n') : WP_CLI::colorize('%RNo%n'),
-                $status['stage'] ?: 'N/A',
+                $status['running'] ? WP_CLI::colorize('%GRunning%n') : WP_CLI::colorize('%RNot running%n'),
+                $stageText,
+                $overallText,
                 gmdate('H:i:s', $elapsed)
             );
+            WP_CLI::log($headerLine);
 
-            // Pad line to clear any previous longer output
-            WP_CLI::log(str_pad($line, 100));
+            // --- Stage pipeline (visual progress bar) ---
+            if (!empty($status['stage_details'])) {
+                $pipeline = self::formatStagePipeline($status['stage_details']);
+                WP_CLI::log('  ' . $pipeline);
+            }
 
-            // If stage changed, log it
-            if ($status['stage'] !== $lastStage && !empty($status['stage'])) {
-                WP_CLI::log(sprintf('  -> Stage changed to: %s', $status['stage']));
+            // --- Summary counters ---
+            $summary = $status['summary'] ?? [];
+            if (!empty($summary)) {
+                $counters = [];
+                if (!empty($summary['scannedFiles'])) {
+                    $counters[] = 'Files: ' . number_format($summary['scannedFiles']);
+                }
+                if (!empty($summary['scannedPlugins'])) {
+                    $counters[] = 'Plugins: ' . $summary['scannedPlugins'];
+                }
+                if (!empty($summary['scannedThemes'])) {
+                    $counters[] = 'Themes: ' . $summary['scannedThemes'];
+                }
+                if (!empty($summary['scannedPosts'])) {
+                    $counters[] = 'Posts: ' . number_format($summary['scannedPosts']);
+                }
+                if (!empty($summary['scannedComments'])) {
+                    $counters[] = 'Comments: ' . number_format($summary['scannedComments']);
+                }
+                if (!empty($summary['scannedURLs'])) {
+                    $counters[] = 'URLs: ' . number_format($summary['scannedURLs']);
+                }
+                if (!empty($counters)) {
+                    WP_CLI::log('  ' . WP_CLI::colorize('%c' . implode(' | ', $counters) . '%n'));
+                }
+            }
+
+            // --- Real-time log stream (verbose mode) ---
+            if ($verbose) {
+                $logData = WordfenceService::getStatusSince($lastCtime);
+                $lastCtime = $logData['last_ctime'];
+                foreach ($logData['entries'] as $entry) {
+                    $msg = $entry['message'];
+                    // Color SUM_ messages for visibility
+                    if (strpos($msg, 'SUM_') === 0) {
+                        $msg = WP_CLI::colorize('%y' . $msg . '%n');
+                    }
+                    WP_CLI::log(sprintf('    [%s] %s', $entry['time'], $msg));
+                }
+            }
+
+            // --- Stage change notification ---
+            if ($status['stage'] !== $lastStage && !empty($status['stage']) && $status['stage'] !== 'N/A') {
+                WP_CLI::log(WP_CLI::colorize(sprintf('  %G▶ Stage changed to: %s%n', $status['stage'])));
                 $lastStage = $status['stage'];
             }
 
-            // If scan stopped, show final message
+            // --- Scan finished ---
             if (!$status['running']) {
                 WP_CLI::log('');
-                WP_CLI::log(WP_CLI::colorize('%YScan is not running.%n'));
+                WP_CLI::log(WP_CLI::colorize('%YScan complete.%n'));
                 WP_CLI::log(sprintf('Last scan: %s', $status['last_scan']));
+
+                if (!empty($status['last_scan_duration'])) {
+                    WP_CLI::log(sprintf('Duration: %d seconds', $status['last_scan_duration']));
+                }
 
                 $issues = WordfenceService::getIssues('new');
                 if (count($issues) > 0) {
-                    WP_CLI::log(sprintf('Issues found: %d', count($issues)));
+                    WP_CLI::log(WP_CLI::colorize(sprintf('%RIssues found: %d%n', count($issues))));
                     WP_CLI::log('Use "wp wfsec issues list" to view.');
+                } else {
+                    WP_CLI::log(WP_CLI::colorize('%GNo issues found.%n'));
                 }
                 break;
             }
 
             sleep($interval);
         }
+    }
+
+    /**
+     * Format the stage pipeline as a single-line visual indicator.
+     *
+     * Example output:
+     *   ✓ Server State  ✓ File Changes  ▶ Malware Scan [67%]  ○ Content Safety  ○ Password Strength
+     */
+    private static function formatStagePipeline(array $stageDetails): string
+    {
+        $parts = [];
+        foreach ($stageDetails as $data) {
+            $name = $data['name'];
+            $status = $data['status'];
+            $progress = $data['progress'] ?? 0;
+
+            if (in_array($status, ['complete-success', 'complete-warning'], true)) {
+                $icon = $status === 'complete-warning'
+                    ? WP_CLI::colorize('%y⚠%n')
+                    : WP_CLI::colorize('%g✓%n');
+                $parts[] = $icon . ' ' . $name;
+            } elseif (in_array($status, ['running', 'running-warning'], true)) {
+                $pctText = $progress > 0 ? " [{$progress}%]" : '';
+                $parts[] = WP_CLI::colorize('%B▶ ' . $name . $pctText . '%n');
+            } else {
+                // pending
+                $parts[] = WP_CLI::colorize('%w○ ' . $name . '%n');
+            }
+        }
+
+        return implode('  ', $parts);
     }
 }

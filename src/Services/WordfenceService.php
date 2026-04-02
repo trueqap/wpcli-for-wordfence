@@ -239,7 +239,29 @@ class WordfenceService
     }
 
     /**
-     * Get scan status
+     * Human-readable names for Wordfence scan stages.
+     * Keys match the stage keys used in Wordfence's scanStageStatuses option.
+     */
+    public const STAGE_NAMES = [
+        'spamvertising' => 'Spamvertising Check',
+        'spam'          => 'Spam Check',
+        'blacklist'     => 'Blocklist Check',
+        'server'        => 'Server State',
+        'changes'       => 'File Changes',
+        'public'        => 'Public Files',
+        'malware'       => 'Malware Scan',
+        'content'       => 'Content Safety',
+        'password'      => 'Password Strength',
+        'vulnerability' => 'Vulnerability Scan',
+        'options'       => 'Options Audit',
+    ];
+
+    /**
+     * Get scan status with real-time stage progress from Wordfence internals.
+     *
+     * Reads scanStageStatuses (serialized array in wfConfig) which contains
+     * per-stage status, started/finished/expected counts — the same data
+     * the Wordfence admin panel uses for its progress display.
      */
     public static function getScanStatus(): array
     {
@@ -251,19 +273,112 @@ class WordfenceService
         $scanRunning = (int) \wfConfig::get('wf_scanRunning', 0);
         $running = $scanRunning && (time() - $scanRunning < 86400);
 
-        $stage = \wfConfig::get('wf_scanStage', '') ?: \wfConfig::get('scanStage', '');
+        // Read the real stage statuses — this is what the admin panel uses
+        $stageStatuses = [];
+        if (method_exists('wfConfig', 'get_ser')) {
+            $stageStatuses = \wfConfig::get_ser('scanStageStatuses', []);
+        }
+        if (!is_array($stageStatuses)) {
+            $stageStatuses = [];
+        }
+
+        // Read live summary counters (files scanned, posts, etc.)
+        $summaryItems = [];
+        if (method_exists('wfConfig', 'get_ser')) {
+            $summaryItems = \wfConfig::get_ser('wf_summaryItems', []);
+        }
+        if (!is_array($summaryItems)) {
+            $summaryItems = [];
+        }
+
+        // Determine current stage and overall progress from stage statuses
+        $currentStage = 'N/A';
+        $currentStageProgress = '';
+        $overallProgress = 0;
+        $stagesComplete = 0;
+        $stagesTotal = 0;
+        $stageDetails = [];
+
+        if (!empty($stageStatuses)) {
+            foreach ($stageStatuses as $key => $data) {
+                if (!is_array($data)) {
+                    continue;
+                }
+                $status = $data['status'] ?? 'pending';
+
+                // Skip premium-only and disabled stages
+                if ($status === 'premium' || $status === 'disabled') {
+                    continue;
+                }
+
+                $stagesTotal++;
+                $humanName = self::STAGE_NAMES[$key] ?? ucfirst($key);
+                $finished = (int) ($data['finished'] ?? 0);
+                $expected = (int) ($data['expected'] ?? 0);
+
+                if (in_array($status, ['complete-success', 'complete-warning'], true)) {
+                    $stagesComplete++;
+                    $stageDetails[$key] = [
+                        'name'     => $humanName,
+                        'status'   => $status,
+                        'progress' => 100,
+                        'finished' => $finished,
+                        'expected' => $expected,
+                    ];
+                } elseif (in_array($status, ['running', 'running-warning'], true)) {
+                    $currentStage = $humanName;
+                    $pct = $expected > 0 ? round(($finished / $expected) * 100) : 0;
+                    $currentStageProgress = $expected > 0
+                        ? sprintf('%d/%d (%d%%)', $finished, $expected, $pct)
+                        : 'in progress';
+                    $stageDetails[$key] = [
+                        'name'     => $humanName,
+                        'status'   => $status,
+                        'progress' => $pct,
+                        'finished' => $finished,
+                        'expected' => $expected,
+                    ];
+                } else {
+                    $stageDetails[$key] = [
+                        'name'     => $humanName,
+                        'status'   => $status,
+                        'progress' => 0,
+                        'finished' => $finished,
+                        'expected' => $expected,
+                    ];
+                }
+            }
+
+            if ($stagesTotal > 0) {
+                $overallProgress = round(($stagesComplete / $stagesTotal) * 100);
+            }
+        }
+
+        // Fallback: if no stage statuses available, try the legacy keys
+        if ($currentStage === 'N/A' && empty($stageStatuses)) {
+            $legacyStage = \wfConfig::get('wf_scanStage', '') ?: \wfConfig::get('scanStage', '');
+            if ($legacyStage) {
+                $currentStage = $legacyStage;
+            }
+        }
 
         // Get last scan info from wfStatus table
         $lastScanInfo = self::getLastScanInfo();
         $lastScan = $lastScanInfo['timestamp'] ?? 0;
 
         return [
-            'running' => (bool) $running,
-            'stage' => $stage ?: ($lastScanInfo['stage'] ?? 'N/A'),
-            'last_scan' => $lastScan ? date('Y-m-d H:i:s', $lastScan) : 'Never',
-            'last_scan_timestamp' => $lastScan,
-            'last_scan_duration' => $lastScanInfo['duration'] ?? null,
-            'last_scan_result' => $lastScanInfo['result'] ?? null,
+            'running'              => (bool) $running,
+            'stage'                => $currentStage,
+            'stage_progress'       => $currentStageProgress,
+            'overall_progress'     => $overallProgress,
+            'stages_complete'      => $stagesComplete,
+            'stages_total'         => $stagesTotal,
+            'stage_details'        => $stageDetails,
+            'summary'              => $summaryItems,
+            'last_scan'            => $lastScan ? date('Y-m-d H:i:s', $lastScan) : 'Never',
+            'last_scan_timestamp'  => $lastScan,
+            'last_scan_duration'   => $lastScanInfo['duration'] ?? null,
+            'last_scan_result'     => $lastScanInfo['result'] ?? null,
         ];
     }
 
@@ -317,6 +432,59 @@ class WordfenceService
             'result' => $result['msg'],
             'stage' => $stage ? preg_replace('/^SUM_START:/', '', $stage) : null,
         ];
+    }
+
+    /**
+     * Get new scan log entries since a given timestamp.
+     *
+     * Polls the wfStatus table for entries added after $sinceCtime,
+     * returning them in chronological order. This is the same table
+     * the Wordfence admin panel polls via AJAX for real-time updates.
+     *
+     * @param float $sinceCtime  Return entries newer than this ctime value.
+     * @param int   $limit       Maximum entries to return per call.
+     * @return array{entries: array, last_ctime: float}
+     */
+    public static function getStatusSince(float $sinceCtime = 0.0, int $limit = 100): array
+    {
+        global $wpdb;
+        $table = $wpdb->prefix . 'wfstatus';
+
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+        if ($wpdb->get_var($wpdb->prepare("SHOW TABLES LIKE %s", $table)) !== $table) {
+            return ['entries' => [], 'last_ctime' => $sinceCtime];
+        }
+
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+        $results = $wpdb->get_results(
+            $wpdb->prepare(
+                "SELECT ctime, level, type, msg FROM {$table} WHERE ctime > %f ORDER BY ctime ASC LIMIT %d",
+                $sinceCtime,
+                $limit
+            ),
+            ARRAY_A
+        );
+
+        if (empty($results)) {
+            return ['entries' => [], 'last_ctime' => $sinceCtime];
+        }
+
+        $lastCtime = $sinceCtime;
+        $entries = [];
+        foreach ($results as $row) {
+            $ctime = (float) $row['ctime'];
+            if ($ctime > $lastCtime) {
+                $lastCtime = $ctime;
+            }
+            $entries[] = [
+                'time'    => date('H:i:s', (int) floor($ctime)),
+                'level'   => (int) $row['level'],
+                'type'    => $row['type'],
+                'message' => $row['msg'],
+            ];
+        }
+
+        return ['entries' => $entries, 'last_ctime' => $lastCtime];
     }
 
     /**
