@@ -395,7 +395,7 @@ class ScanCommand
 
             // --- Stage change notification ---
             if ($status['stage'] !== $lastStage && !empty($status['stage']) && $status['stage'] !== 'N/A') {
-                WP_CLI::log(WP_CLI::colorize(sprintf('  %G▶ Stage changed to: %s%n', $status['stage'])));
+                WP_CLI::log(WP_CLI::colorize('  %G▶ Stage changed to: ' . $status['stage'] . '%n'));
                 $lastStage = $status['stage'];
             }
 
@@ -411,7 +411,7 @@ class ScanCommand
 
                 $issues = WordfenceService::getIssues('new');
                 if (count($issues) > 0) {
-                    WP_CLI::log(WP_CLI::colorize(sprintf('%RIssues found: %d%n', count($issues))));
+                    WP_CLI::log(WP_CLI::colorize('%RIssues found: ' . count($issues) . '%n'));
                     WP_CLI::log('Use "wp wfsec issues list" to view.');
                 } else {
                     WP_CLI::log(WP_CLI::colorize('%GNo issues found.%n'));
